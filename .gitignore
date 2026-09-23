@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .venv/
+.pylibs/
+acceptance.db
+*.db
