@@ -9,9 +9,13 @@
     main { max-width: 760px; margin: 20px auto; padding: 0 12px; }
     input, button { padding: 8px; margin-right: 8px; }
     .alarm { color: #fca5a5; } .ok { color: #86efac; }
+    .temp { color: #fcd34d; }
     #live { min-height: 1.4em; }
     table { width: 100%; border-collapse: collapse; }
     td, th { border-bottom: 1px solid #57534e; padding: 6px; text-align: left; }
+    .panel { background: #292524; border: 1px solid #57534e; padding: 10px 12px; margin-bottom: 14px; }
+    .panel h3 { margin: 0 0 8px; font-size: 1em; }
+    #raiseForm input { width: 90px; }
   </style>
 </head>
 <body>
@@ -30,6 +34,23 @@
     </section>
     <section id="app" hidden>
       <p id="live">等待推送</p>
+      <div class="panel">
+        <h3>报警线</h3>
+        <p id="thresholdState">加载中…</p>
+        <form id="raiseForm" hidden>
+          临时抬到
+          <input id="raiseValue" type="number" step="0.1" min="1.1" placeholder="1.5" />
+          % ，
+          <input id="raiseSeconds" type="number" step="1" min="1" placeholder="120" />
+          秒后自动失效，回到 1%
+          <button>抬高</button>
+        </form>
+        <p style="margin:8px 0 4px">抬线履历（只读）</p>
+        <table>
+          <thead><tr><th>临时线 %</th><th>设定时刻</th><th>失效时刻</th><th>设定人</th></tr></thead>
+          <tbody id="raiseRows"></tbody>
+        </table>
+      </div>
       <form id="form">
         <input id="site" placeholder="测点" />
         <input id="ch4" type="number" step="0.01" placeholder="甲烷 %" />

@@ -9,7 +9,7 @@ from pydantic_settings import BaseSettings
 from sqlalchemy import DateTime, Float, String, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-from app.rules import classify
+from app.rules import DEFAULT_THRESHOLD, classify
 
 
 class Settings(BaseSettings):
@@ -44,6 +44,17 @@ class Reading(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class ThresholdRaise(Base):
+    """临时抬线履历，只追加；旧记录永不更新或删除。"""
+
+    __tablename__ = "threshold_raises"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    threshold: Mapped[float] = mapped_column(Float)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_by: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class LoginIn(BaseModel):
     username: str
     password: str
@@ -52,6 +63,12 @@ class LoginIn(BaseModel):
 class ReadingIn(BaseModel):
     site: str = Field(min_length=1, max_length=80)
     ch4_pct: float
+
+
+class ThresholdRaiseIn(BaseModel):
+    threshold: float = Field(gt=DEFAULT_THRESHOLD)
+    # 有效期（秒），检查员抬线时给一个较短的失效时刻
+    valid_seconds: int = Field(gt=0, le=24 * 3600)
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
@@ -69,12 +86,47 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(secu
 
 def require_writer(user: dict = Depends(current_user)) -> dict:
     if user["role"] != "writer":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅瓦斯检查员可上报")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅瓦斯检查员可操作")
     return user
 
 
 sockets: set[WebSocket] = set()
 app = FastAPI(title="矿井瓦斯班测台")
+
+
+def active_threshold(db: Session, now: datetime | None = None) -> tuple[float, ThresholdRaise | None]:
+    """返回当前生效的报警线；没有未失效的临时线时回到百分之一。
+
+    履历只追加，失效记录原样保留，不覆盖、不删除。
+    同一时刻有多条有效记录（不同抬线失效时刻不同）时取最新一条。
+    """
+    now = now or datetime.now(timezone.utc)
+    raise_ = (
+        db.query(ThresholdRaise)
+        .filter(ThresholdRaise.expires_at > now)
+        .order_by(ThresholdRaise.id.desc())
+        .first()
+    )
+    if raise_ is None:
+        return DEFAULT_THRESHOLD, None
+    return raise_.threshold, raise_
+
+
+def _iso(dt: datetime) -> str:
+    # sqlite 读回的时间不带时区，统一按 UTC 输出（postgres 下本就来去一致）
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
+
+def raise_to_dict(r: ThresholdRaise) -> dict:
+    return {
+        "id": r.id,
+        "threshold": r.threshold,
+        "expires_at": _iso(r.expires_at),
+        "created_by": r.created_by,
+        "created_at": _iso(r.created_at),
+    }
 
 
 @app.on_event("startup")
@@ -142,32 +194,84 @@ def list_readings(_user: dict = Depends(current_user)):
 
 @app.post("/api/readings", status_code=201)
 async def create_reading(body: ReadingIn, user: dict = Depends(require_writer)):
-    level, note = classify(body.ch4_pct)
     db = SessionLocal()
     try:
+        now = datetime.now(timezone.utc)
+        threshold, raise_ = active_threshold(db, now)
+        level, note = classify(body.ch4_pct, threshold)
         row = Reading(
             site=body.site.strip(),
             ch4_pct=body.ch4_pct,
             level=level,
             note=note,
             created_by=user["username"],
-            created_at=datetime.now(timezone.utc),
+            created_at=now,
         )
         db.add(row)
         db.commit()
         db.refresh(row)
-        payload = {"id": row.id, "site": row.site, "ch4_pct": row.ch4_pct, "level": row.level, "note": row.note}
+        payload = {
+            "id": row.id,
+            "site": row.site,
+            "ch4_pct": row.ch4_pct,
+            "level": row.level,
+            "note": row.note,
+            "threshold": threshold,
+        }
+        is_alarm = row.level == "报警"
     finally:
         db.close()
-    dead = []
-    for ws in list(sockets):
-        try:
-            await ws.send_json(payload)
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        sockets.discard(ws)
+    # 推送规则跟着当前报警线走：只有判定为报警才推送；
+    # 临时线生效期间低于临时线的正常读数不推送报警。
+    if is_alarm:
+        dead = []
+        for ws in list(sockets):
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            sockets.discard(ws)
     return payload
+
+
+@app.get("/api/thresholds")
+def list_thresholds(_user: dict = Depends(current_user)):
+    """当前线 + 完整抬线履历。旁观账号只读。"""
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        threshold, raise_ = active_threshold(db, now)
+        history = db.query(ThresholdRaise).order_by(ThresholdRaise.id.desc()).all()
+        return {
+            "current": threshold,
+            "default": DEFAULT_THRESHOLD,
+            "active_raise": raise_to_dict(raise_) if raise_ else None,
+            "server_time": now.isoformat(),
+            "history": [raise_to_dict(r) for r in history],
+        }
+    finally:
+        db.close()
+
+
+@app.post("/api/thresholds", status_code=201)
+def raise_threshold(body: ThresholdRaiseIn, user: dict = Depends(require_writer)):
+    """检查员临时抬高报警线并设定失效时刻；每次抬高追加一条履历。"""
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        row = ThresholdRaise(
+            threshold=body.threshold,
+            expires_at=now + timedelta(seconds=body.valid_seconds),
+            created_by=user["username"],
+            created_at=now,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return raise_to_dict(row)
+    finally:
+        db.close()
 
 
 @app.websocket("/ws/alerts")
